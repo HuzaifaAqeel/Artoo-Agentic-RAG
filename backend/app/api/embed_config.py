@@ -1,0 +1,438 @@
+"""Embedding/Rerank 模型配置管理接口
+
+统一使用远程服务，通过此接口管理服务地址和参数。
+"""
+
+import uuid
+import logging
+from typing import Optional
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import require_platform
+from app.schema.db import EmbedConfig
+from app.storage.database import get_db
+
+logger = logging.getLogger(__name__)
+
+# 能力配置（Embedding/Rerank 服务）属平台底座，全平台一份，仅超级管理员维护
+# （capability-config-to-platform）。EmbedConfig 表本就无 tenant_id（全局单份），
+# 此处仅收紧守卫为 require_platform：超管可管，租户管理员不再可见可改。
+router = APIRouter(
+    prefix="/api/embed-configs",
+    tags=["Embed Config"],
+    dependencies=[Depends(require_platform())],
+)
+
+
+# ============================================================
+# 请求/响应模型
+# ============================================================
+
+
+class EmbedConfigCreate(BaseModel):
+    name: str
+    config_type: str  # embedding | rerank
+    vendor: Optional[str] = None  # 模型厂商（仅 UI 记忆，运行时仍走 URL 格式自动检测）
+    model_name: str = "BAAI/bge-m3"
+    # 远程服务字段
+    base_url: str
+    api_key: Optional[str] = None
+    timeout: float = 60.0
+    # sparse 向量支持（仅 embedding 类型有效）
+    sparse_enabled: bool = True
+    # 状态
+    is_active: bool = False
+
+
+class EmbedConfigUpdate(BaseModel):
+    name: Optional[str] = None
+    vendor: Optional[str] = None
+    model_name: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    timeout: Optional[float] = None
+    sparse_enabled: Optional[bool] = None
+    is_active: Optional[bool] = None
+
+
+class EmbedConfigResponse(BaseModel):
+    model_config = {"from_attributes": True}
+    id: str
+    name: str
+    config_type: str
+    provider: str
+    vendor: Optional[str] = None
+    model_name: str
+    base_url: Optional[str] = None
+    api_key_set: bool
+    timeout: float
+    sparse_enabled: bool
+    is_active: bool
+    created_at: str
+    updated_at: str
+
+
+class EmbedTestRequest(BaseModel):
+    """测试连通性请求"""
+    model_name: str = "BAAI/bge-m3"
+    base_url: str
+    api_key: Optional[str] = None
+    timeout: float = 60.0
+    config_type: str = "embedding"  # embedding | rerank
+    config_id: Optional[str] = None  # 编辑已有配置时传入，用于在 api_key 为空时回退到已保存的密钥
+    sparse_enabled: bool = True  # 是否测试 sparse 端点
+
+
+class EmbedTestResponse(BaseModel):
+    success: bool
+    message: str
+
+
+# ============================================================
+# 辅助函数
+# ============================================================
+
+
+def _to_response(config: EmbedConfig) -> EmbedConfigResponse:
+    return EmbedConfigResponse(
+        id=config.id,
+        name=config.name,
+        config_type=config.config_type,
+        provider=config.provider,
+        vendor=config.vendor,
+        model_name=config.model_name,
+        base_url=config.base_url,
+        api_key_set=bool(config.api_key),
+        timeout=config.timeout,
+        sparse_enabled=config.sparse_enabled,
+        is_active=config.is_active,
+        created_at=config.created_at.isoformat() if config.created_at else "",
+        updated_at=config.updated_at.isoformat() if config.updated_at else "",
+    )
+
+
+async def _apply_config_change(db: AsyncSession, config_type: str) -> None:
+    """让 Embedding/Rerank 配置变更立即生效（本进程重载 + 广播其他进程）
+
+    先提交事务再重载：重载与其他进程都按"数据库现状"取 active 配置，
+    未提交则读到旧数据。按现状重载（而非用刚写入的对象）才能覆盖
+    停用与删除场景——那两种情况需要重新查库才知道现在谁是 active。
+
+    Args:
+        db: 当前请求的数据库会话
+        config_type: ``embedding`` 或 ``rerank``
+    """
+    from app.api.capability_reload import apply_and_broadcast
+
+    await db.commit()
+    await apply_and_broadcast(config_type)
+
+
+# ============================================================
+# 接口实现
+# ============================================================
+
+
+@router.get("", response_model=list[EmbedConfigResponse])
+async def list_embed_configs(
+    config_type: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """获取所有 Embedding/Rerank 配置"""
+    query = select(EmbedConfig).order_by(EmbedConfig.created_at.desc())
+    if config_type:
+        query = query.where(EmbedConfig.config_type == config_type)
+    result = await db.execute(query)
+    configs = result.scalars().all()
+    return [_to_response(c) for c in configs]
+
+
+class EmbedCurrentResponse(BaseModel):
+    """当前生效的 Embedding/Rerank 配置"""
+    embed_model: str
+    embed_base_url: str
+    embed_sparse_enabled: bool
+    rerank_model: str
+    rerank_base_url: str
+    # 该项是否回落自环境变量（数据库无 active 配置时为 True）
+    embed_from_env: bool = False
+    rerank_from_env: bool = False
+
+
+@router.get("/current", response_model=EmbedCurrentResponse)
+async def get_current_embed_config(db: AsyncSession = Depends(get_db)):
+    """获取当前生效的 Embedding/Rerank 配置
+
+    以数据库中 ``is_active`` 的配置为准（那才是运行时真正加载的），
+    无 active 记录时回落环境变量并以 ``*_from_env`` 标注来源。
+    """
+    from app.config import get_settings
+
+    settings = get_settings()
+
+    async def _active(config_type: str) -> Optional[EmbedConfig]:
+        result = await db.execute(
+            select(EmbedConfig).where(
+                EmbedConfig.config_type == config_type,
+                EmbedConfig.is_active == True,  # noqa: E712 — SQLAlchemy 表达式
+            )
+        )
+        return result.scalars().first()
+
+    embed = await _active("embedding")
+    rerank = await _active("rerank")
+
+    return EmbedCurrentResponse(
+        embed_model=embed.model_name if embed else settings.embed_model,
+        embed_base_url=(embed.base_url or "") if embed else settings.embed_base_url,
+        embed_sparse_enabled=(
+            embed.sparse_enabled if embed else settings.embed_sparse_enabled
+        ),
+        rerank_model=rerank.model_name if rerank else settings.rerank_model,
+        rerank_base_url=(rerank.base_url or "") if rerank else settings.rerank_base_url,
+        embed_from_env=embed is None,
+        rerank_from_env=rerank is None,
+    )
+
+
+@router.post("", response_model=EmbedConfigResponse, status_code=201)
+async def create_embed_config(body: EmbedConfigCreate, db: AsyncSession = Depends(get_db)):
+    """创建 Embedding/Rerank 配置"""
+    config_id = str(uuid.uuid4())
+
+    # 如果设为启用，取消同类型的其他启用配置
+    if body.is_active:
+        result = await db.execute(
+            select(EmbedConfig).where(
+                EmbedConfig.config_type == body.config_type,
+                EmbedConfig.is_active == True,
+            )
+        )
+        for c in result.scalars().all():
+            c.is_active = False
+
+    config = EmbedConfig(
+        id=config_id,
+        name=body.name,
+        config_type=body.config_type,
+        provider="remote",
+        vendor=body.vendor,
+        model_name=body.model_name,
+        base_url=body.base_url,
+        api_key=body.api_key or None,
+        timeout=body.timeout,
+        sparse_enabled=body.sparse_enabled,
+        is_active=body.is_active,
+    )
+    db.add(config)
+    await db.flush()
+    await db.refresh(config)
+
+    # 无条件热生效：新增非 active 配置也可能改变了同类型其他配置的 active 状态
+    response = _to_response(config)
+    await _apply_config_change(db, config.config_type)
+    return response
+
+
+@router.put("/{config_id}", response_model=EmbedConfigResponse)
+async def update_embed_config(config_id: str, body: EmbedConfigUpdate, db: AsyncSession = Depends(get_db)):
+    """更新 Embedding/Rerank 配置"""
+    result = await db.execute(select(EmbedConfig).where(EmbedConfig.id == config_id))
+    config = result.scalar_one_or_none()
+    if config is None:
+        raise HTTPException(status_code=404, detail="配置不存在")
+
+    update_data = body.model_dump(exclude_unset=True)
+
+    # 如果设为启用，取消同类型的其他启用配置
+    if update_data.get("is_active"):
+        others = await db.execute(
+            select(EmbedConfig).where(
+                EmbedConfig.config_type == config.config_type,
+                EmbedConfig.is_active == True,
+                EmbedConfig.id != config_id,
+            )
+        )
+        for c in others.scalars().all():
+            c.is_active = False
+
+    for field, value in update_data.items():
+        setattr(config, field, value)
+
+    await db.flush()
+    await db.refresh(config)
+
+    # 无条件热生效：停用当前 active 配置同样需要重载（回落到环境变量或其他 active 配置）
+    response = _to_response(config)
+    await _apply_config_change(db, config.config_type)
+    return response
+
+
+@router.delete("/{config_id}", status_code=204)
+async def delete_embed_config(config_id: str, db: AsyncSession = Depends(get_db)):
+    """删除 Embedding/Rerank 配置"""
+    result = await db.execute(select(EmbedConfig).where(EmbedConfig.id == config_id))
+    config = result.scalar_one_or_none()
+    if config is None:
+        raise HTTPException(status_code=404, detail="配置不存在")
+    config_type = config.config_type
+    await db.delete(config)
+    await db.flush()
+
+    # 删除后热生效：避免进程继续使用已删除的服务
+    await _apply_config_change(db, config_type)
+
+
+@router.post("/test", response_model=EmbedTestResponse)
+async def test_embed_connection(body: EmbedTestRequest, db: AsyncSession = Depends(get_db)):
+    """测试 Embedding/Rerank 服务连通性"""
+    # 如果 api_key 为空且传了 config_id，从数据库回退获取已保存的密钥
+    if not body.api_key and body.config_id:
+        result = await db.execute(select(EmbedConfig).where(EmbedConfig.id == body.config_id))
+        saved = result.scalar_one_or_none()
+        if saved and saved.api_key:
+            body.api_key = saved.api_key
+
+    if not body.base_url:
+        return EmbedTestResponse(success=False, message="远程服务地址不能为空")
+
+    # 探活策略（与 Worker 启动健康检查共用 app.models.probe）：
+    # 1. 优先探 /health —— 自建服务（TEI/Infinity）即使推理队列打满也能秒回，不占队列。
+    # 2. /health 不存在（404/405）—— 云端网关（百炼）只有推理端点，降级为最小推理请求验证。
+    from app.models.probe import check_health
+
+    try:
+        health = await check_health(body.base_url, timeout=5.0)
+    except httpx.ConnectError:
+        return EmbedTestResponse(success=False, message="无法连接到服务，请检查地址")
+    except httpx.TimeoutException:
+        return EmbedTestResponse(success=False, message="连接超时，请检查地址和网络")
+    except Exception as e:
+        logger.warning("health 探测异常，降级为推理探活: %s", e)
+        health = None
+
+    if health is False:
+        return EmbedTestResponse(success=False, message="服务未就绪，请检查服务状态")
+
+    # 自建服务 /health 已通过 —— 额外探测实际推理端点的「路径 + 鉴权」是否正确。
+    # 策略：发一个带 Auth 但 body 为空的 POST 到推理端点。
+    # - 路径错 → 404（端点不存在）
+    # - Key 错/缺 → 401（鉴权失败）
+    # - 路径对 + Key 对 → 400/422（参数不全,预期行为,证明端点可达且鉴权通过）
+    # 不会占用推理队列（请求在参数校验阶段就被拒绝,不入队）。
+    if health is True:
+        from app.models.embedding.remote import embeddings_url
+        from app.models.rerank.remote import rerank_url
+        # 推导实际推理端点 URL —— 复用 Provider 同款逻辑（含 DashScope 归一化），
+        # 保证「测试连通性」与真实入库走完全一致的 URL，不再各自拼接导致分叉。
+        if body.config_type == "rerank":
+            probe_url = rerank_url(body.base_url)
+        else:
+            probe_url = embeddings_url(body.base_url)
+
+        headers = {"Content-Type": "application/json"}
+        if body.api_key:
+            headers["Authorization"] = f"Bearer {body.api_key}"
+
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                # 发空 JSON body — 触发快速 400/422，不进推理队列
+                resp = await client.post(probe_url, headers=headers, json={})
+            if resp.status_code == 401:
+                return EmbedTestResponse(success=False, message="鉴权失败 (HTTP 401)，请检查 API Key")
+            if resp.status_code == 403:
+                return EmbedTestResponse(success=False, message="鉴权失败 (HTTP 403)，请检查 API Key")
+            if resp.status_code == 404:
+                return EmbedTestResponse(
+                    success=False,
+                    message="推理端点不存在 (HTTP 404)，请检查服务地址格式（Infinity 模式不带 /v1）",
+                )
+            # 400/422/200 都说明端点可达 + 鉴权通过
+        except httpx.ConnectError:
+            return EmbedTestResponse(success=False, message="无法连接到推理端点，请检查地址")
+        except httpx.TimeoutException:
+            return EmbedTestResponse(success=False, message="推理端点超时，请检查地址")
+        except Exception:
+            pass  # 其他异常不阻断，继续走正常流程
+
+        # 端点可达 + 鉴权通过，补充 sparse 检测
+        if body.config_type == "embedding" and body.sparse_enabled:
+            embedder = RemoteEmbedder(
+                base_url=body.base_url,
+                model=body.model_name,
+                api_key=body.api_key or "",
+                timeout=min(body.timeout, 15.0),
+                sparse_enabled=body.sparse_enabled,
+            )
+            sparse_ok = await embedder.check_sparse_support()
+            suffix = "；Sparse 端点可用 ✓" if sparse_ok else "；Sparse 端点不可用（将降级为 BM25 兜底）"
+            return EmbedTestResponse(success=True, message="连接成功，服务在线" + suffix)
+        return EmbedTestResponse(success=True, message="连接成功，服务在线")
+
+    # health is None：无 /health 路由（云端网关），发最小推理请求验证
+    try:
+        if body.config_type == "embedding":
+            from app.models.embedding.remote import RemoteEmbedder
+            embedder = RemoteEmbedder(
+                base_url=body.base_url,
+                model=body.model_name,
+                api_key=body.api_key or "",
+                timeout=min(body.timeout, 15.0),
+                sparse_enabled=body.sparse_enabled,
+            )
+            vectors = await embedder.embed(["连接测试"])
+            dim = len(vectors[0]) if vectors and vectors[0] else 0
+            msg = f"连接成功，向量维度 {dim}" if dim else "连接成功，服务在线"
+            if body.sparse_enabled:
+                sparse_ok = await embedder.check_sparse_support()
+                msg += "；Sparse 端点可用 ✓" if sparse_ok else "；Sparse 端点不可用（将降级为 BM25 兜底）"
+            return EmbedTestResponse(success=True, message=msg)
+        else:
+            from app.models.rerank.remote import RemoteReranker
+            reranker = RemoteReranker(
+                base_url=body.base_url,
+                model=body.model_name,
+                api_key=body.api_key or "",
+                timeout=min(body.timeout, 15.0),
+            )
+            await reranker.rerank("连接测试", ["这是一段用于连通性测试的候选文本"], top_k=1)
+            return EmbedTestResponse(success=True, message="连接成功，服务在线")
+
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        detail = e.response.text[:200] if e.response.text else ""
+        if code in (401, 403):
+            return EmbedTestResponse(success=False, message=f"鉴权失败 (HTTP {code})，请检查 API Key")
+        if code == 404:
+            return EmbedTestResponse(success=False, message=f"端点不存在 (HTTP 404)，请检查服务地址和接口格式。{detail}")
+        return EmbedTestResponse(success=False, message=f"服务返回错误 (HTTP {code})。{detail}")
+    except httpx.ConnectError:
+        return EmbedTestResponse(success=False, message="无法连接到服务，请检查地址")
+    except httpx.TimeoutException:
+        return EmbedTestResponse(success=False, message="连接超时，请检查地址和网络")
+    except Exception as e:
+        logger.exception("Embed/Rerank 测试失败")
+        return EmbedTestResponse(success=False, message=f"测试失败: {str(e)}")
+
+
+@router.post("/{config_id}/test", response_model=EmbedTestResponse)
+async def test_saved_embed_config(config_id: str, db: AsyncSession = Depends(get_db)):
+    """测试已保存的配置连通性"""
+    result = await db.execute(select(EmbedConfig).where(EmbedConfig.id == config_id))
+    config = result.scalar_one_or_none()
+    if config is None:
+        raise HTTPException(status_code=404, detail="配置不存在")
+
+    return await test_embed_connection(EmbedTestRequest(
+        model_name=config.model_name,
+        base_url=config.base_url or "",
+        api_key=config.api_key,
+        timeout=config.timeout,
+        config_type=config.config_type,
+        sparse_enabled=config.sparse_enabled,
+    ), db=db)
